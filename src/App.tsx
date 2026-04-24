@@ -1,27 +1,37 @@
 import { useState, useEffect, useCallback } from 'react';
 import type { PriceData, Trade, TradeNote, AppState } from './types';
-import { loadState, saveState, calcPnL } from './services/storage';
+import { calcPnL } from './services/storage';
 import { fetchPrices } from './services/priceService';
+import {
+  loadStateFromSupabase, saveTradeToSupabase, deleteTradeFromSupabase,
+  saveNoteToSupabase, deleteNoteFromSupabase, saveBudget
+} from './services/supabase';
 import Dashboard from './components/Dashboard';
 import TradeJournal from './components/TradeJournal';
 import TradeNotes from './components/TradeNotes';
 import Analytics from './components/Analytics';
 import {
-  LayoutDashboard, BookOpen, StickyNote, BarChart3, RefreshCw
+  LayoutDashboard, BookOpen, StickyNote, BarChart3, RefreshCw, Cloud, CloudOff
 } from 'lucide-react';
 
 type Page = 'dashboard' | 'journal' | 'notes' | 'analytics';
 
 export default function App() {
   const [page, setPage] = useState<Page>('dashboard');
-  const [state, setState] = useState<AppState>(loadState);
+  const [state, setState] = useState<AppState>({ budget: 0, trades: [], notes: [] });
   const [prices, setPrices] = useState<PriceData[]>([]);
   const [loading, setLoading] = useState(true);
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
+  const [syncStatus, setSyncStatus] = useState<'synced' | 'syncing' | 'error'>('syncing');
 
-  const persist = useCallback((s: AppState) => {
-    setState(s);
-    saveState(s);
+  // İlk yükleme - Supabase'ten
+  useEffect(() => {
+    loadStateFromSupabase().then(s => {
+      setState(s);
+      setSyncStatus('synced');
+    }).catch(() => {
+      setSyncStatus('error');
+    });
   }, []);
 
   const refreshPrices = useCallback(async () => {
@@ -42,6 +52,91 @@ export default function App() {
     return () => clearInterval(interval);
   }, [refreshPrices]);
 
+  // Trade işlemleri
+  const handleAddTrade = async (t: Trade) => {
+    setSyncStatus('syncing');
+    try {
+      await saveTradeToSupabase(t);
+      setState(prev => ({ ...prev, trades: [...prev.trades, t] }));
+      setSyncStatus('synced');
+    } catch {
+      setSyncStatus('error');
+    }
+  };
+
+  const handleUpdateTrade = async (t: Trade) => {
+    setSyncStatus('syncing');
+    try {
+      await saveTradeToSupabase(t);
+      setState(prev => ({
+        ...prev,
+        trades: prev.trades.map(tr => tr.id === t.id ? t : tr)
+      }));
+      setSyncStatus('synced');
+    } catch {
+      setSyncStatus('error');
+    }
+  };
+
+  const handleDeleteTrade = async (id: string) => {
+    setSyncStatus('syncing');
+    try {
+      await deleteTradeFromSupabase(id);
+      setState(prev => ({
+        ...prev,
+        trades: prev.trades.filter(tr => tr.id !== id)
+      }));
+      setSyncStatus('synced');
+    } catch {
+      setSyncStatus('error');
+    }
+  };
+
+  // Note işlemleri
+  const handleAddNote = async (n: TradeNote) => {
+    setSyncStatus('syncing');
+    try {
+      await saveNoteToSupabase(n);
+      setState(prev => ({ ...prev, notes: [...prev.notes, n] }));
+      setSyncStatus('synced');
+    } catch {
+      setSyncStatus('error');
+    }
+  };
+
+  const handleUpdateNote = async (n: TradeNote) => {
+    setSyncStatus('syncing');
+    try {
+      await saveNoteToSupabase(n);
+      setState(prev => ({
+        ...prev,
+        notes: prev.notes.map(nt => nt.id === n.id ? n : nt)
+      }));
+      setSyncStatus('synced');
+    } catch {
+      setSyncStatus('error');
+    }
+  };
+
+  const handleDeleteNote = async (id: string) => {
+    setSyncStatus('syncing');
+    try {
+      await deleteNoteFromSupabase(id);
+      setState(prev => ({
+        ...prev,
+        notes: prev.notes.filter(nt => nt.id !== id)
+      }));
+      setSyncStatus('synced');
+    } catch {
+      setSyncStatus('error');
+    }
+  };
+
+  const handleBudgetChange = (b: number) => {
+    saveBudget(b);
+    setState(prev => ({ ...prev, budget: b }));
+  };
+
   const totalPnL = state.trades.reduce((sum, t) => sum + (calcPnL(t) ?? 0), 0);
   const closedTrades = state.trades.filter(t => t.exitPrice !== null);
   const winCount = closedTrades.filter(t => (calcPnL(t) ?? 0) > 0).length;
@@ -57,6 +152,9 @@ export default function App() {
     { key: 'notes', label: 'Notlar', icon: <StickyNote size={18} /> },
     { key: 'analytics', label: 'Analiz', icon: <BarChart3 size={18} /> },
   ];
+
+  const SyncIcon = syncStatus === 'synced' ? Cloud : syncStatus === 'syncing' ? RefreshCw : CloudOff;
+  const syncColor = syncStatus === 'synced' ? 'var(--green)' : syncStatus === 'syncing' ? 'var(--cyan)' : 'var(--red)';
 
   return (
     <div className="min-h-screen" style={{ background: 'var(--bg-primary)' }}>
@@ -93,6 +191,7 @@ export default function App() {
           </nav>
 
           <div className="flex items-center gap-3">
+            <SyncIcon size={16} style={{ color: syncColor }} className={syncStatus === 'syncing' ? 'animate-spin' : ''} />
             {lastUpdate && (
               <span className="text-xs" style={{ color: 'var(--gray)' }}>
                 {lastUpdate.toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })}
@@ -121,35 +220,23 @@ export default function App() {
             closedCount={closedCount}
             bestTrade={bestTrade}
             worstTrade={worstTrade}
-            onBudgetChange={(b) => persist({ ...state, budget: b })}
+            onBudgetChange={handleBudgetChange}
           />
         )}
         {page === 'journal' && (
           <TradeJournal
             trades={state.trades}
-            onAdd={(t: Trade) => persist({ ...state, trades: [...state.trades, t] })}
-            onUpdate={(t: Trade) => persist({
-              ...state,
-              trades: state.trades.map(tr => tr.id === t.id ? t : tr)
-            })}
-            onDelete={(id: string) => persist({
-              ...state,
-              trades: state.trades.filter(tr => tr.id !== id)
-            })}
+            onAdd={handleAddTrade}
+            onUpdate={handleUpdateTrade}
+            onDelete={handleDeleteTrade}
           />
         )}
         {page === 'notes' && (
           <TradeNotes
             notes={state.notes}
-            onAdd={(n: TradeNote) => persist({ ...state, notes: [...state.notes, n] })}
-            onUpdate={(n: TradeNote) => persist({
-              ...state,
-              notes: state.notes.map(nt => nt.id === n.id ? n : nt)
-            })}
-            onDelete={(id: string) => persist({
-              ...state,
-              notes: state.notes.filter(nt => nt.id !== id)
-            })}
+            onAdd={handleAddNote}
+            onUpdate={handleUpdateNote}
+            onDelete={handleDeleteNote}
           />
         )}
         {page === 'analytics' && <Analytics state={state} />}
